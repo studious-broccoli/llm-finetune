@@ -1,8 +1,12 @@
+"""
+    Script: llm-finetune.py
+    Description: complete LLM fine-tuning pipeline using Hugging Face Transformers
+                + PEFT (LoRA) + quantization + MLflow for tracking and evaluation
+"""
+
 import os
-# disable Weights and Biases
-os.environ['WANDB_DISABLED'] = "true"
 import math
-import numpy as np
+# import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from collections import Counter
@@ -11,10 +15,13 @@ import evaluate
 from transformers import pipeline
 from peft import LoraConfig, get_peft_model, TaskType
 
-
+# Begin MLFlow Experiment
 import mlflow
 mlflow.set_tracking_uri("http://localhost:5000")
 mlflow.set_experiment("llm-finetune-gpt2")
+
+# disable Weights and Biases
+os.environ['WANDB_DISABLED'] = "true"
 
 output_dir = "./results_llm"
 os.makedirs(output_dir, exist_ok=True)
@@ -41,38 +48,24 @@ from transformers import (
 # --------------------------------------------
 # Load dataset from https://huggingface.co/datasets
 # --------------------------------------------
-# huggingface_dataset_name = "neil-code/dialogsum-test"
-# dataset = load_dataset(huggingface_dataset_name)
+# WikiText is a clean dump of WikiPedia articles
+# Using Causal Language Modeling (CLM) objective — predicting the next word/token.
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
 print(dataset["train"][0])
 
 
 # --------------------------------------------
-# Create Bitsandbytes configuration
-# --------------------------------------------
-compute_dtype = getattr(torch, "float16")
-bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type='nf4',
-        bnb_4bit_compute_dtype=compute_dtype,
-        bnb_4bit_use_double_quant=False,
-    )
-
-
-# --------------------------------------------
 # Load Tokenizer and model
 # --------------------------------------------
-model_name = "gpt2"  # You can replace with EleutherAI/gpt-neo-125M, etc.
+model_name = "gpt2"  # GPT-2 tokenizer converts raw text into tokens
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-
-# GPT2 doesn't have padding token by default
-tokenizer.pad_token = tokenizer.eos_token
+tokenizer.pad_token = tokenizer.eos_token  # no pad token, add EOS token for padding to maintain format
 
 
 # --------------------------------------------
 # Tokenize the dataset
 # --------------------------------------------
+# Chunking: concatenate text into blocks to simulate a continuous stream.
 def group_texts(examples):
     block_size = 128
     concatenated = {k: sum(examples[k], []) for k in examples.keys()}
@@ -85,6 +78,7 @@ def group_texts(examples):
     return result
 
 
+# Convert text into Tokens
 def tokenize_function(examples):
     return tokenizer(
         examples["text"],
@@ -114,16 +108,21 @@ data_collator = DataCollatorForLanguageModeling(
 
 
 # --------------------------------------------
-# Load model
+# Create Bitsandbytes configuration
+# Quantization (4-bit) to reduce memory and speed up training
 # --------------------------------------------
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    quantization_config=bnb_config,
-    device_map="auto"
-)
-model.resize_token_embeddings(len(tokenizer))
+compute_dtype = getattr(torch, "float16")
+bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type='nf4',
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_use_double_quant=False,
+    )
 
-# Add LoRA adapters
+
+# --------------------------------------------
+# LoRA (Low-Rank Adapters) training only a small part of the model - helps efficiency
+# --------------------------------------------
 lora_config = LoraConfig(
     r=8,
     lora_alpha=32,
@@ -132,19 +131,30 @@ lora_config = LoraConfig(
     bias="none",
     task_type=TaskType.CAUSAL_LM
 )
+
+
+# --------------------------------------------
+# Load model
+# --------------------------------------------
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map="auto"
+)
+model.resize_token_embeddings(len(tokenizer))
 model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
 
-# --------------------------------------------
-# Evaluate model
-# --------------------------------------------
-metric = evaluate.load("accuracy")
-
-# def compute_metrics(eval_pred):
-#    logits, labels = eval_pred
-#    predictions = np.argmax(logits, axis=-1)
-#    return metric.compute(predictions=predictions, references=labels)
+# # --------------------------------------------
+# # Evaluate model
+# # --------------------------------------------
+# metric = evaluate.load("accuracy")
+#
+# # def compute_metrics(eval_pred):
+# #    logits, labels = eval_pred
+# #    predictions = np.argmax(logits, axis=-1)
+# #    return metric.compute(predictions=predictions, references=labels)
 
 
 # --------------------------------------------
@@ -213,7 +223,7 @@ tokenizer.save_pretrained(os.path.join(output_dir, "fine-tuned-model"))
 
 
 # --------------------------------------------
-# Evaluate
+# Evaluate Perplexity (how well model predicts a sequence of words)
 # --------------------------------------------
 eval_results = trainer.evaluate()
 print(f"Perplexity: {math.exp(eval_results['eval_loss'])}")
@@ -311,9 +321,34 @@ mlflow.set_tracking_uri("file:./mlruns")
 print("[-] Run: $ mlflow ui")
 
 
+"""
+Output figures:
+- bleu_score: how close model generated text is to a reference (higher is better, 0–1).
+- eval_loss: how well the model did on the validation set (lower = better).
+- eval_runtime: how long evaluation took (in seconds).
+- eval_samples_per_second: how many examples were evaluated per second — shows efficiency.
+- eval_steps_per_second: how fast eval steps are processed (higher = faster)
+- final_perplexity: measures how "surprised" the model is by the data — lower = better, ideal is ~1
+- grad_norm: size of gradients during training — helps detect vanishing/exploding gradients
+- learning_rate: step size the model takes during training — how fast it learns.
+- loss: training loss at a particular step — lower is better.
+- total_flos: total number of floating point operations — a rough measure of compute cost
+- train_loss: average loss the model saw while training — should trend down
+- train_runtime: ttal time training took (in seconds)
+- train_samples_per_second: speed of training in terms of examples per second
+- train_steps_per_second: speed of training in terms of steps per second.
+- loss_curve: how loss (train & eval) changed over time — helps visualize learning progress
+- multiple_generations.txt: file with generated text samples for several different prompts
+- sample_output.txt: generated example from model, typically from a main prompt
+- token_frequencies.png: bar chart of the most common tokens in training data — good for sanity-checking inputs
+
+"""
+
 # --------------------------------------------
 # Tutorial Sources
 # --------------------------------------------
 # https://www.datacamp.com/tutorial/fine-tuning-large-language-models
 # https://www.reddit.com/r/LocalLLaMA/comments/1fm59kg/how_do_you_actually_finetune_a_llm_on_your_own/
 # https://dassum.medium.com/fine-tune-large-language-model-llm-on-a-custom-dataset-with-qlora-fb60abdeba07
+# huggingface_dataset_name = "neil-code/dialogsum-test"
+# dataset = load_dataset(huggingface_dataset_name)
