@@ -28,6 +28,8 @@ Outputs (MLFlow):
 - train_runtime: ttal time training took (in seconds)
 - train_samples_per_second: speed of training in terms of examples per second
 - train_steps_per_second: speed of training in terms of steps per second.
+
+
 Outputs (local):
 - loss_curve: how loss (train & eval) changed over time — helps visualize learning progress
 - multiple_generations.txt: file with generated text samples for several different prompts
