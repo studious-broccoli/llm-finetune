@@ -99,15 +99,6 @@ small_eval_dataset = tokenized_dataset["test"].shuffle(seed=42).select(range(100
 
 
 # --------------------------------------------
-# Data collator for language modeling
-# --------------------------------------------
-data_collator = DataCollatorForLanguageModeling(
-    tokenizer=tokenizer,
-    mlm=False  # Set to True if using a masked language model like BERT
-)
-
-
-# --------------------------------------------
 # Create Bitsandbytes configuration
 # Quantization (4-bit) to reduce memory and speed up training
 # --------------------------------------------
