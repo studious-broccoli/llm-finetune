@@ -99,6 +99,113 @@ small_eval_dataset = tokenized_dataset["test"].shuffle(seed=42).select(range(100
 
 
 # --------------------------------------------
+# Evaluation helpers
+# --------------------------------------------
+
+def build_continuation_eval_set(
+    eval_dataset, tok, n: int = 20
+) -> list[tuple[str, str]]:
+    """Build prompt/reference pairs for continuation evaluation.
+
+    Each pair splits a tokenized block at the midpoint: the first half is the
+    prompt fed to the model, the second half is the ground-truth continuation
+    used as the evaluation reference.
+
+    Args:
+        eval_dataset: Tokenized HuggingFace dataset with an ``input_ids`` field.
+        tok: Tokenizer used to decode token IDs back to strings.
+        n: Maximum number of pairs to return.
+
+    Returns:
+        List of ``(prompt_text, reference_continuation)`` tuples.
+    """
+    pairs: list[tuple[str, str]] = []
+    for sample in eval_dataset.select(range(min(n * 3, len(eval_dataset)))):
+        ids = sample["input_ids"]
+        if len(ids) < 32:
+            continue
+        split = len(ids) // 2
+        prompt = tok.decode(ids[:split], skip_special_tokens=True).strip()
+        reference = tok.decode(ids[split:], skip_special_tokens=True).strip()
+        if len(prompt) > 10 and len(reference) > 10:
+            pairs.append((prompt, reference))
+        if len(pairs) >= n:
+            break
+    return pairs
+
+
+def compute_generation_metrics(
+    predictions: list[str], references: list[str]
+) -> dict[str, float]:
+    """Compute ROUGE and BERTScore between generated and reference continuations.
+
+    Args:
+        predictions: Model-generated text continuations.
+        references: Ground-truth reference continuations.
+
+    Returns:
+        Dict mapping metric name to score (``rouge1``, ``rouge2``, ``rougeL``,
+        ``bertscore_f1``).
+    """
+    rouge = evaluate.load("rouge")
+    rouge_result = rouge.compute(predictions=predictions, references=references)
+
+    bertscore = evaluate.load("bertscore")
+    bs_result = bertscore.compute(
+        predictions=predictions,
+        references=references,
+        model_type="distilbert-base-uncased",
+        verbose=False,
+    )
+
+    return {
+        "rouge1": rouge_result["rouge1"],
+        "rouge2": rouge_result["rouge2"],
+        "rougeL": rouge_result["rougeL"],
+        "bertscore_f1": sum(bs_result["f1"]) / len(bs_result["f1"]),
+    }
+
+
+def plot_metric_comparison(
+    baseline_metrics: dict[str, float],
+    finetuned_metrics: dict[str, float],
+    save_path: str,
+) -> None:
+    """Plot a grouped bar chart comparing baseline vs fine-tuned metric scores.
+
+    Args:
+        baseline_metrics: Scores from the base (pre-LoRA) model.
+        finetuned_metrics: Scores from the fine-tuned model.
+        save_path: File path where the figure will be saved.
+    """
+    metric_names = list(baseline_metrics.keys())
+    x = list(range(len(metric_names)))
+    width = 0.35
+
+    _, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(
+        [i - width / 2 for i in x],
+        [baseline_metrics[m] for m in metric_names],
+        width,
+        label="Baseline (GPT-2)",
+    )
+    ax.bar(
+        [i + width / 2 for i in x],
+        [finetuned_metrics[m] for m in metric_names],
+        width,
+        label="Fine-tuned (LoRA)",
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_names)
+    ax.set_ylabel("Score")
+    ax.set_title("Baseline vs Fine-tuned: Generation Quality Metrics")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+
+# --------------------------------------------
 # Create Bitsandbytes configuration
 # Quantization (4-bit) to reduce memory and speed up training
 # --------------------------------------------
@@ -133,6 +240,23 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 model.resize_token_embeddings(len(tokenizer))
+
+# --------------------------------------------
+# Baseline generation (pre-LoRA, base GPT-2)
+# --------------------------------------------
+eval_pairs = build_continuation_eval_set(small_eval_dataset, tokenizer)
+eval_prompts = [p for p, _ in eval_pairs]
+eval_references = [r for _, r in eval_pairs]
+
+base_pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+baseline_generations = [
+    base_pipe(p, max_new_tokens=64, do_sample=False, repetition_penalty=1.3)[0]["generated_text"][len(p):]
+    for p in eval_prompts
+]
+del base_pipe
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
@@ -227,7 +351,7 @@ plot_loss(trainer.state.log_history, save_path=os.path.join(output_dir, "loss_cu
 # --------------------------------------------
 # Pipeline
 # --------------------------------------------
-pipe = pipeline("text-generation", model="./fine-tuned-model", tokenizer=tokenizer)
+pipe = pipeline("text-generation", model=os.path.join(output_dir, "fine-tuned-model"), tokenizer=tokenizer)
 prompt = "The future of AI in medicine is"
 print(pipe(prompt, max_new_tokens=50)[0]["generated_text"])
 
@@ -254,15 +378,21 @@ plt.close()
 
 
 # --------------------------------------------
-# BLEU
+# Richer evaluation: ROUGE + BERTScore, baseline vs fine-tuned
 # --------------------------------------------
-from evaluate import load
-bleu = load("bleu")
+finetuned_generations = [
+    pipe(p, max_new_tokens=64, do_sample=False, repetition_penalty=1.3)[0]["generated_text"][len(p):]
+    for p in eval_prompts
+]
 
-sample_output = pipe(prompt, max_new_tokens=50)[0]["generated_text"]
-reference_text = "The future of AI in medicine is bright and full of potential."
-result = bleu.compute(predictions=[sample_output], references=[reference_text])
-print("BLEU Score:", result)
+baseline_metrics = compute_generation_metrics(baseline_generations, eval_references)
+finetuned_metrics = compute_generation_metrics(finetuned_generations, eval_references)
+
+print("\nBaseline metrics:", baseline_metrics)
+print("Fine-tuned metrics:", finetuned_metrics)
+
+comparison_path = os.path.join(output_dir, "metric_comparison.png")
+plot_metric_comparison(baseline_metrics, finetuned_metrics, save_path=comparison_path)
 
 
 prompts = [
@@ -284,9 +414,13 @@ with open(os.path.join(output_dir, "multiple_generations.txt"), "w") as f:
 mlflow.log_metric("final_perplexity", math.exp(eval_results['eval_loss']))
 mlflow.log_artifact(os.path.join(output_dir, "loss_curve.png"))
 mlflow.log_artifact(os.path.join(output_dir, "sample_output.txt"))
-mlflow.log_metric("bleu_score", result["bleu"])
-mlflow.log_artifact("token_frequencies.png")
 mlflow.log_artifact(os.path.join(output_dir, "multiple_generations.txt"))
+mlflow.log_artifact("token_frequencies.png")
+mlflow.log_artifact(comparison_path)
+for name, score in baseline_metrics.items():
+    mlflow.log_metric(f"baseline_{name}", score)
+for name, score in finetuned_metrics.items():
+    mlflow.log_metric(f"finetuned_{name}", score)
 mlflow.set_tracking_uri("file:./mlruns")
 print("[-] Run: $ mlflow ui")
 
